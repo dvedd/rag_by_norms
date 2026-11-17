@@ -167,17 +167,6 @@ User -> Streamlit UI -> retriever_api -> hybrid search + ref expansion
 Generation метрики считаются через LLM-as-judge по вопросу, найденному
 контексту и итоговому ответу.
 
-| Метрика | Значение |
-|---------|----------|
-| Вопросов | 200 |
-| `de_recall@5` | 0.85 |
-| `de_recall@10` | 0.92 |
-| `ee_recall` | 0.85 |
-| `ce_recall` | 0.83 |
-| `MRR` | 0.69 |
-| `faithfulness` | 0.93 |
-| `answer_relevance` | 0.95 |
-
 Коротко о метриках:
 
 - `de_recall` - нужный фрагмент найден в прямой поисковой выдаче;
@@ -381,7 +370,6 @@ EngineeringRAG начинался как прикладная задача по�
 
 ## Документация
 
-- [ML System Design Doc](docs/ML%20system%20design%20doc.md)
-- [Gold dataset](docs/gold_dataset)
+- [ML System Design Doc](ML%20system%20design%20doc.md)
 - [Метрики качества](services/retriever/app/metrics)
 - [Подготовка Linux](scripts/setup-linux.md)
