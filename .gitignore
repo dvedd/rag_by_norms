@@ -1,0 +1,35 @@
+План реализации RAG.md
+/venv/
+.env
+output
+/data/
+# /data/minio
+# /data/qdrant
+client-postgres-init/
+__pycache__
+airflow/logs
+QWEN.md
+.qwen
+.zed
+.pytest_cache
+retriever_service/logs
+AGENTS.md
+main copy.py
+files_eximple
+metrics_ab_plan.md
+авторизация.md
+# Retriever eval run artifacts
+services/retriever/app/eval/results/[0-9]*T[0-9]*Z/
+cold_offer_pilot.md
+cold_offer_pilot.tex
+warm_offer_product_strategy.md
+Теплое_предложение_EngineeringRAG_продукт.md
+retriever_context_memory.md
+rag_research_answer_plan.md
+gold_dataset
+construction_budget_forecast
+.agents
+.ruff_cache
+.codex
+configs
+docs

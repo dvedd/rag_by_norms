@@ -1,0 +1,226 @@
+import argparse
+import asyncio
+import json
+import logging
+import os
+from contextlib import AsyncExitStack
+from datetime import UTC, datetime
+from pathlib import Path
+
+from anyio import CancelScope
+from openai import AsyncOpenAI
+from app.concurrency import run_blocking
+
+from app.errors import log_failure
+from app.eval.dataset import EvalRunConfig, load_dataset, load_run_config
+from app.eval.report import build_summary, render_markdown
+from app.metrics.generation import GenerationMetricCalculator
+from app.metrics.retrieval import calculate_retrieval_metrics
+from app.metrics.schemas import EvalQuestion
+from app.pipeline.search_pipeline import SearchPipeline
+from app.pipeline.services import compose_answer, rewrite_query
+from app.pipeline.services.retriever import open_retriever
+from app.schemas import LLMConfig, SearchRequest
+
+logger = logging.getLogger(__name__)
+
+
+class EvalRunner:
+    """Run dependent question stages sequentially and isolate failed questions."""
+
+    def __init__(
+        self,
+        pipeline: SearchPipeline,
+        config: EvalRunConfig,
+        generation_metrics: GenerationMetricCalculator | None = None,
+    ) -> None:
+        self.pipeline = pipeline
+        self.config = config
+        self.generation_metrics = generation_metrics
+
+    async def run(self, questions: list[EvalQuestion]) -> list[dict]:
+        """Return one evaluation record per question, including safe failures."""
+        records: list[dict] = []
+        total = len(questions)
+        print(f"Running evaluation for {total} questions", flush=True)
+
+        for index, question in enumerate(questions, start=1):
+            print(f"[{index}/{total}] {question.id}: running", flush=True)
+            try:
+                records.append(await self._run_question(question=question))
+            except Exception as ex:
+                records.append(_error_record(question=question, error=ex))
+                log_failure(logger=logger, operation="eval_question", error=ex)
+                print(f"[{index}/{total}] {question.id}: failed", flush=True)
+            else:
+                print(f"[{index}/{total}] {question.id}: done", flush=True)
+
+        return records
+
+    async def _run_question(self, question: EvalQuestion) -> dict:
+        pipeline_result = await self.pipeline.run(
+            self._search_request(question=question),
+            index_version=self.config.index_version,
+        )
+        retrieval = calculate_retrieval_metrics(
+            pipeline_result=pipeline_result, ground_truth=question
+        )
+        generation = None
+
+        if self.generation_metrics:
+            generation = await self.generation_metrics.calculate(pipeline_result)
+
+        return {
+            "question_id": question.id,
+            "pipeline_result": pipeline_result.model_dump(mode="json"),
+            "retrieval_metrics": retrieval.model_dump(mode="json"),
+            "generation_metrics": generation.model_dump(mode="json")
+            if generation
+            else {},
+        }
+
+    def _search_request(self, question: EvalQuestion) -> SearchRequest:
+        return SearchRequest(
+            query=question.question,
+            index_version=self.config.index_version,
+            top_k=self.config.top_k,
+            prefetch_k=self.config.prefetch_k,
+            mode=self.config.search_mode,
+            use_rewriter=self.config.use_rewriter,
+            expand_refs=self.config.expand_refs,
+            ref_depth=self.config.ref_depth,
+            rewrite_system_prompt=self.config.rewrite_system_prompt,
+            compose_system_prompt=self.config.compose_system_prompt,
+        )
+
+
+def _error_record(question: EvalQuestion, error: Exception) -> dict:
+    return {
+        "question_id": question.id,
+        "pipeline_result": {},
+        "retrieval_metrics": {},
+        "generation_metrics": {},
+        "error": type(error).__name__,
+    }
+
+
+async def _run_cli(args: argparse.Namespace) -> Path:
+    config = await run_blocking(load_run_config, path=args.config)
+    questions = await run_blocking(load_dataset, path=args.dataset)
+    api_key = os.getenv("OPENAI_API_KEY") or "EMPTY"
+    stack = AsyncExitStack()
+
+    try:
+        retriever = await run_blocking(open_retriever, stack=stack)
+        client = await stack.enter_async_context(
+            cm=AsyncOpenAI(
+                base_url=LLMConfig.REWRITER_BASE_URL,
+                api_key=api_key,
+                timeout=120,
+            )
+        )
+        pipeline = SearchPipeline(
+            retriever=retriever,
+            llm_client=client,
+            rewriter=rewrite_query,
+            composer=compose_answer,
+        )
+        generation = _generation_calculator(client=client, config=config)
+        runner = EvalRunner(
+            pipeline=pipeline, config=config, generation_metrics=generation
+        )
+        records = await runner.run(questions=questions)
+    finally:
+        with CancelScope(shield=True):
+            await stack.aclose()
+
+    return await run_blocking(
+        _write_results,
+        output_dir=args.output_dir,
+        config=config,
+        records=records,
+    )
+
+
+def _generation_calculator(
+    client: AsyncOpenAI,
+    config: EvalRunConfig,
+) -> GenerationMetricCalculator | None:
+    if not config.judge_model:
+        return None
+
+    return GenerationMetricCalculator(client, config.judge_model)
+
+
+def _write_results(output_dir: Path, config: EvalRunConfig, records: list[dict]) -> Path:
+    created_at = datetime.now(UTC)
+    run_id = created_at.strftime("%Y%m%dT%H%M%SZ")
+    run_dir = output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    config_payload = config.model_dump(mode="json")
+    run_summary = {
+        "run_id": run_id,
+        "created_at": created_at.isoformat(),
+        "config_path": f"{run_id}/config.json",
+        "config": config_payload,
+        **build_summary(records=records),
+    }
+
+    _write_json(path=run_dir / "config.json", payload=config_payload)
+    _write_json(path=run_dir / "per_question.json", payload=records)
+    _update_history(output_dir=output_dir, run_summary=run_summary)
+
+    return run_dir
+
+
+def _update_history(output_dir: Path, run_summary: dict) -> None:
+    summary_path = output_dir / "summary.json"
+    history = _load_history(path=summary_path)
+    history["runs"].append(run_summary)
+
+    _write_json(path=summary_path, payload=history)
+    (output_dir / "report.md").write_text(
+        render_markdown(runs=history["runs"]),
+        encoding="utf-8",
+    )
+
+
+def _load_history(path: Path) -> dict:
+    if not path.exists():
+        return {"runs": []}
+
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: dict | list[dict]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run retriever offline evaluation")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        default=Path("app/eval/data/questions.jsonl"),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        default=Path("app/eval/configs/retrieval_baseline.json"),
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("app/eval/results"))
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Parse CLI arguments and print the generated evaluation directory."""
+    run_dir = asyncio.run(_run_cli(args=_parse_args()))
+    print(run_dir)
+
+
+# ../../venv/bin/python -m app.eval.runner
+if __name__ == "__main__":
+    main()
