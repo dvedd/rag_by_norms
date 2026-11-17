@@ -32,4 +32,5 @@ construction_budget_forecast
 .ruff_cache
 .codex
 configs
-docs
+construction_budget_forecast
+gold_dataset
